@@ -30,7 +30,7 @@ flowchart TB
 
 | Order | Subproblem | Why it comes here | Component needed |
 | --- | --- | --- | --- |
-| 1 | Define record identity, field versions, and history | Every later rule depends on what a record and an edit mean. | Postgres schema and version comparator |
+| 1 | Define record identity, field versions, and history | Every later rule depends on what a record and an edit mean. | Postgres schema, ID mapping, and version comparator |
 | 2 | Validate and apply each inbound event once | Webhook retries and process restarts must not lose a committed update or apply it twice. | Webhook endpoint and processed-event ledger |
 | 3 | Merge each changed field and retain all changes | Out-of-order events and concurrent edits depend on per-field ordering. | Inbox processor and append-only history |
 | 4 | Save portal changes and outbound work atomically | A committed user edit must not disappear before Salesforce is updated. | Portal API and transactional outbox |
@@ -44,14 +44,14 @@ Store only the brief's customer fields (`name`, `status`, `owner`) and contact f
 
 | Table | Important fields | Purpose |
 | --- | --- | --- |
-| `sync_record` | `object_type`, `portal_id`, `salesforce_id`, current allowed fields | Current portal view; unique mapping from Salesforce ID to portal ID. |
+| `sync_record` | `object_type`, `portal_id`, `salesforce_id`, optional stable external key, current allowed fields | Current portal view; unique mapping from each system's ID to the same synchronized record. |
 | `field_version` | record key, field name, winning `source`, `occurred_at`, portal sequence, event ID | Per-field ordering metadata; avoids an old event replacing a newer field. |
 | `change_history` | event ID, record key, field, old value, new value, actor, source, source time, received time, applied/current flag | Append-only audit of every distinct valid field change, including a late change that does not win current state. |
 | `processed_webhook` | event ID, payload hash, processed time | Deduplicate committed webhook applications and detect a reused event ID with different content. |
 | `outbox_event` | local event ID, record key, changed fields, actor, version, attempts, next attempt, state | Durable Salesforce writes created in the same transaction as a portal save. |
 | `sync_cursor` | query cursor or last confirmed Salesforce modification marker | Resume reconciliation after an outage without skipping a page. |
 
-Use a unique constraint on Salesforce event ID and on the Salesforce/portal record mapping. A transaction processes an event's inbox state, per-field updates, and history rows together. Portal save, field versions/history, and its outbox row also commit together. Keep the history immutable and retain it according to an agreed client retention policy; the required retention period is not stated in the brief. Protect personal data with TLS, restricted service access, and encrypted storage according to the hosting platform's controls.
+Use unique constraints on Salesforce event ID and on each system's record mapping. Add indexes for record lookup by `(object_type, salesforce_id)`, field versions by record and field, history by record/field/time, and pending outbox rows by state/next-attempt time. At 5 million records, these indexed lookups and a single Postgres primary are the starting design; confirm write volume and history retention before choosing partitioning or read replicas. A transaction applies the webhook's field changes, writes history, and adds its processed-event ledger entry together. Portal save, field versions/history, and its outbox row also commit together. Keep history immutable and retain it according to an agreed client retention policy; the required retention period is not stated. Protect personal data with TLS, restricted service access, and encrypted storage according to the hosting platform's controls.
 
 ## 5. Inbound path: webhook to portal database
 
@@ -69,11 +69,11 @@ The brief's example contains a changed-field map, so the design treats it as a d
 
 ## 6. Outbound path: portal edit to Salesforce
 
-1. Authenticate the portal user and validate allowed fields. The server supplies actor, UTC timestamp, and per-record sequence.
+1. Authenticate the portal user and validate allowed fields. The server supplies actor, UTC timestamp, per-record sequence, and a stable portal record ID. Do not infer that two independent creates represent the same entity from name/email/phone alone; a shared matching key and merge rule must be agreed separately.
 2. In one Postgres transaction, save the edit, update each affected field version, append history, and insert an outbox event.
-3. A worker claims outbox work and calls Salesforce. Use bounded exponential backoff with jitter for transient errors and `Retry-After` for throttling. All attempts consume the same API budget. Never discard pending work on a timeout, restart, or rate limit response.
+3. A worker claims outbox work and calls Salesforce. For a new portal record, use Salesforce upsert by a stable external key if the API supports it, so retry after an ambiguous timeout does not create a second record. Use bounded exponential backoff with jitter for transient errors and `Retry-After` for throttling. All attempts consume the same API budget. Never discard pending work on a timeout, restart, or rate limit response. If the API cannot safely upsert, look up the stable key before retrying a create; if neither is supported, treat this as an unresolved blocker.
 4. Mark the outbox item delivered only after a confirmed success. A timeout with an unknown remote outcome is retried; the Salesforce update should be idempotent (setting a field to the same value). If Salesforce supports conditional writes or idempotency keys, use them after confirming the API contract.
-5. Preserve per-record ordering in the worker: do not send an older queued field version after a newer one. Coalesce unsent updates to different fields of the same record where safe, while retaining every original edit in history.
+5. Resolve contact-to-customer references using the ID mapping. If the customer has not been created/mapped on Salesforce yet, keep the contact work item durable but blocked until its customer is available. Preserve per-record ordering in the worker: do not send an older queued field version after a newer one. Coalesce unsent updates to different fields of the same record where safe, while retaining every original edit in history.
 
 ## 7. Concurrent edits and current-value rule
 
