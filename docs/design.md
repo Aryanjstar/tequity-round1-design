@@ -20,7 +20,7 @@ flowchart TB
   APP -->|"record + outbox transaction"| DB
 ```
 
-**Inbound interface:** `POST /webhooks/salesforce` accepts the supplied `eventId`, `recordId`, `objectType`, `occurredAt`, `changedBy`, and `changedFields`. Authenticate the caller using the mechanism Salesforce supports; the exact signature or credential scheme is an open integration question. Validate the object type and allow-listed fields before enqueueing. Return success only after the event is durably recorded, so Salesforce can retry if the portal has not accepted it.
+**Inbound interface:** `POST /webhooks/salesforce` accepts the supplied `eventId`, `recordId`, `objectType`, `occurredAt`, `changedBy`, and `changedFields`. Authenticate the caller using the mechanism Salesforce supports; the exact signature or credential scheme is an open integration question. Validate the object type and allow-listed fields before applying any change. Return success only after the changes and processed-event ledger commit, so Salesforce can retry if the portal has not accepted it.
 
 **Portal interface:** the authenticated portal API accepts a record ID, object type, editor identity from the session, and changed fields. The client does not supply the authoritative edit timestamp or sequence; the portal backend creates both when saving.
 
@@ -32,17 +32,11 @@ flowchart TB
 | --- | --- | --- | --- |
 | 1 | Define record identity, field versions, and history | Every later rule depends on what a record and an edit mean. | Postgres schema, ID mapping, and version comparator |
 | 2 | Validate and apply each inbound event once | Webhook retries and process restarts must not lose a committed update or apply it twice. | Webhook endpoint and processed-event ledger |
-| 3 | Merge each changed field and retain all changes | Out-of-order events and concurrent edits depend on per-field ordering. | Inbox processor and append-only history |
+| 3 | Merge each changed field and retain all changes | Out-of-order events and concurrent edits depend on per-field ordering. | Transactional field merge and append-only history |
 | 4 | Save portal changes and outbound work atomically | A committed user edit must not disappear before Salesforce is updated. | Portal API and transactional outbox |
 | 5 | Deliver outbound calls safely under the cap | Retries, throttling, and outages must preserve work and obey the shared limit. | Outbox worker and shared rate limiter |
 | 6 | Identify echoes and reconcile a webhook gap | A loop or an unobserved Salesforce change would invalidate the sync. | Origin check and reconciliation worker |
 | 7 | Monitor the 30-second target and recovery | Operators need to see lag before users report stale data. | Queue/API metrics and alerts |
-
-## 3a. Bootstrap the existing records
-
-The 5 million records imply an initial baseline load. Before cutover, capture a Salesforce change-feed cursor, page through the existing records, and apply the baseline to `sync_record` and the ID mapping. Keep the webhook endpoint active during the scan, then replay the complete change feed from the captured cursor so edits made during the scan are not lost. Apply the baseline and replayed changes through version-aware writes so an older snapshot cannot overwrite a newer edit. Give live webhook transactions and portal edits priority over background scan pages; the 30-second sync target applies to live changes after the integration is enabled.
-
-This bootstrap depends on a paginated or bulk read and a cursor/version contract that the brief does not specify. Ask for the page size, snapshot consistency, and API limits. As an illustration only, 5 million records at 1,000 records per page would require 5,000 read requests; at 80 requests/second that is at least 62.5 seconds of Salesforce request time, excluding pagination, processing, retries, and ongoing writes. If the API returns fewer records per call, bootstrap takes longer. Do not use the 30-second edit SLO as a claim about full baseline completion.
 
 ## 4. Data stored
 
@@ -58,6 +52,12 @@ Store only the brief's customer fields (`name`, `status`, `owner`) and contact f
 | `sync_cursor` | query cursor or last confirmed Salesforce modification marker | Resume reconciliation after an outage without skipping a page. |
 
 Use unique constraints on Salesforce event ID and on each system's record mapping. Add indexes for record lookup by `(object_type, salesforce_id)`, field versions by record and field, history by record/field/time, and pending outbox rows by state/next-attempt time. At 5 million records, these indexed lookups and a single Postgres primary are the starting design; confirm write volume and history retention before choosing partitioning or read replicas. A transaction applies the webhook's field changes, writes history, and adds its processed-event ledger entry together. Portal save, field versions/history, and its outbox row also commit together. Keep history immutable and retain it according to an agreed client retention policy; the required retention period is not stated. Protect personal data with TLS, restricted service access, and encrypted storage according to the hosting platform's controls.
+
+### Initial 5-million-record baseline
+
+Before cutover, capture a Salesforce change-feed cursor, page through the existing records, and apply the baseline to `sync_record` and the ID mapping. Keep the webhook endpoint active during the scan, then replay the complete change feed from the captured cursor so edits made during the scan are not lost. Apply the baseline and replayed changes through version-aware writes so an older snapshot cannot overwrite a newer edit. Give live webhook transactions and portal edits priority over background scan pages; the 30-second sync target applies to live changes after the integration is enabled.
+
+This bootstrap depends on a paginated or bulk read and a cursor/version contract that the brief does not specify. Ask for the page size, snapshot consistency, and API limits. As an illustration only, 5 million records at 1,000 records per page would require 5,000 read requests; at 80 requests/second that is at least 62.5 seconds of Salesforce request time, excluding pagination, processing, retries, and ongoing writes. If the API returns fewer records per call, bootstrap takes longer. Do not use the 30-second edit SLO as a claim about full baseline completion.
 
 ## 5. Inbound path: webhook to portal database
 
@@ -89,7 +89,7 @@ For two updates to the same field, the greater version becomes current; both dis
 
 ## 8. Duplicate and out-of-order events
 
-**Duplicate:** the unique `inbox_event.event_id` makes redelivery a no-op after the first durable acceptance. Return success to stop further retries. History is keyed to the event/field so it is not duplicated.
+**Duplicate:** the unique `processed_webhook.event_id` makes redelivery a no-op after the first committed application. Return success to stop further retries. History is keyed to the event/field so it is not duplicated.
 
 **Out of order:** suppose field `phone` has a stored version at 11:30:05 and a webhook arrives with `occurredAt` 11:30:04. Record that distinct change in history as late/stale, but do not replace current `phone`. Other fields in that same event are independently compared and may still apply if their versions are newer. Never discard an event just because one of its fields is old.
 
@@ -103,7 +103,7 @@ This rule depends on Salesforce echoing the integration actor in `changedBy`. If
 
 ## 10. Six-hour Salesforce outage and recovery arithmetic
 
-Persist the inbox and outbox in Postgres before acknowledging/committing work. During a Salesforce outage, portal edits continue locally and add durable outbox items. Webhooks that never arrive are not in our inbox. After Salesforce returns, replay a complete, paginated change feed/audit source from the last confirmed cursor and merge every missed edit through the same per-field version/history path. Save each page and its next cursor transactionally. The feed must retain intermediate edits, actors, timestamps, and stable versions for the full outage window; a query that returns only each record's latest snapshot is insufficient to preserve history. The existence, retention, page size, and cursor guarantees of this source are open Salesforce questions.
+Persist the processed-event ledger and outbox in Postgres in the same transactions as the applied changes. During a Salesforce outage, portal edits continue locally and add durable outbox items. Webhooks that never arrive are not in our ledger. After Salesforce returns, replay a complete, paginated change feed/audit source from the last confirmed cursor and merge every missed edit through the same per-field version/history path. Save each page and its next cursor transactionally. The feed must retain intermediate edits, actors, timestamps, and stable versions for the full outage window; a query that returns only each record's latest snapshot is insufficient to preserve history. The existence, retention, page size, and cursor guarantees of this source are open Salesforce questions.
 
 **Working estimate:** peak rate = 10 edits/second; outage = 6 hours = 21,600 seconds; one outbound Salesforce request per portal edit; after recovery, reserve 10 requests/second for continuing live edits and target 80 requests/second for outbound work, leaving 20 requests/second of the 100-request cap for reconciliation, retries, and operational headroom.
 
@@ -121,7 +121,7 @@ The 30-second visibility target applies while both systems are up. During the si
 
 | Metric | Alert threshold | Why |
 | --- | --- | --- |
-| Oldest unprocessed inbox/outbox age | Warn at 20 seconds; page at 25 seconds while both systems are healthy | Leaves room to act before the 30-second worst-case sync target is missed. Pause this SLO alert during a declared Salesforce outage; keep outage duration visible. |
+| Webhook apply duration and oldest pending outbox age | Warn at 20 seconds; page at 25 seconds while both systems are healthy | Leaves room to act before the 30-second worst-case sync target is missed. Pause the outbox SLO alert during a declared Salesforce outage; keep outage duration visible. |
 | Outbox backlog and drain rate | Page if backlog grows for 5 minutes while Salesforce is healthy, or if estimated drain time exceeds 60 minutes after recovery | Shows a worker/capacity problem and tests the recovery estimate against actual traffic. |
 | Salesforce API throttles/errors | Page on sustained 429s for 2 minutes or 5xx/error rate above 5% for 5 minutes | Indicates that retries may consume the request budget and threaten freshness or recovery. |
 
