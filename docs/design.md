@@ -13,7 +13,7 @@ The Salesforce CRM and Tequity portal are separate systems. The portal owns its 
 ```mermaid
 flowchart TB
   SF["Salesforce CRM"] -->|"HTTPS webhook"| WH["Portal webhook endpoint"]
-  WH -->|"durable inbox"| DB["Portal Postgres"]
+  WH -->|"validate, apply + audit transaction"| DB["Portal Postgres"]
   DB -->|"work items"| W["Sync workers"]
   W -->|"record API calls"| SF
   U["Portal users"] -->|"HTTPS save"| APP["Portal API"]
@@ -31,7 +31,7 @@ flowchart TB
 | Order | Subproblem | Why it comes here | Component needed |
 | --- | --- | --- | --- |
 | 1 | Define record identity, field versions, and history | Every later rule depends on what a record and an edit mean. | Postgres schema and version comparator |
-| 2 | Accept inbound events durably and only once | Webhook retries and process restarts must not lose an accepted event. | Webhook endpoint and durable inbox |
+| 2 | Validate and apply each inbound event once | Webhook retries and process restarts must not lose a committed update or apply it twice. | Webhook endpoint and processed-event ledger |
 | 3 | Merge each changed field and retain all changes | Out-of-order events and concurrent edits depend on per-field ordering. | Inbox processor and append-only history |
 | 4 | Save portal changes and outbound work atomically | A committed user edit must not disappear before Salesforce is updated. | Portal API and transactional outbox |
 | 5 | Deliver outbound calls safely under the cap | Retries, throttling, and outages must preserve work and obey the shared limit. | Outbox worker and shared rate limiter |
@@ -47,7 +47,7 @@ Store only the brief's customer fields (`name`, `status`, `owner`) and contact f
 | `sync_record` | `object_type`, `portal_id`, `salesforce_id`, current allowed fields | Current portal view; unique mapping from Salesforce ID to portal ID. |
 | `field_version` | record key, field name, winning `source`, `occurred_at`, portal sequence, event ID | Per-field ordering metadata; avoids an old event replacing a newer field. |
 | `change_history` | event ID, record key, field, old value, new value, actor, source, source time, received time, applied/current flag | Append-only audit of every distinct valid field change, including a late change that does not win current state. |
-| `inbox_event` | event ID, payload/hash, received time, processing state | Deduplicate and recover webhook processing after restart. |
+| `processed_webhook` | event ID, payload hash, processed time | Deduplicate committed webhook applications and detect a reused event ID with different content. |
 | `outbox_event` | local event ID, record key, changed fields, actor, version, attempts, next attempt, state | Durable Salesforce writes created in the same transaction as a portal save. |
 | `sync_cursor` | query cursor or last confirmed Salesforce modification marker | Resume reconciliation after an outage without skipping a page. |
 
@@ -55,11 +55,15 @@ Use a unique constraint on Salesforce event ID and on the Salesforce/portal reco
 
 ## 5. Inbound path: webhook to portal database
 
-1. Authenticate the webhook, validate required fields/types, and reject unsupported object types or fields. Do not acknowledge malformed or unauthenticated input as accepted.
-2. Insert the event in `inbox_event` keyed by Salesforce `eventId`. If that key already exists, return success without applying or auditing the event a second time.
-3. After the durable insert, acknowledge the webhook. A worker processes it; request latency does not depend on Salesforce writes.
-4. In a database transaction, compare each changed field's version with the stored field version. Write one history row for every distinct valid field change. Update the current field only if this event wins the comparison. Mark the inbox item processed in the same transaction.
-5. A worker retry after a crash sees either the committed transaction or an unprocessed inbox item; it does not partially apply an event. If the same event ID is redelivered with a different payload hash, quarantine and alert rather than treating it as an ordinary duplicate.
+The brief says the endpoint must accept, check, and apply a webhook before storing it. So the endpoint does not persist an unvalidated request or acknowledge an event for later application. It validates and applies the event synchronously in one database transaction:
+
+1. Authenticate the caller and validate the payload, object type, and allow-listed fields in memory. Reject unauthenticated or malformed requests before writing any row.
+2. Begin a Postgres transaction and check whether `eventId` is already in `processed_webhook`. If so, compare payload hashes; return success for the same event, but quarantine and alert if the same ID has different content.
+3. Compare each changed field's version with its stored version. Write history for each distinct valid field change, including one that loses the current-value comparison. Update current values only for winning fields.
+4. Insert the event ID and payload hash into `processed_webhook` at the end of the transaction, then commit. A unique constraint handles concurrent redeliveries; if another request wins the insert, roll back this transaction and check the committed hash.
+5. Acknowledge Salesforce only after commit. If the process crashes before commit, the transaction rolls back and Salesforce can retry. If it crashes after commit but before the response, the retry sees the processed ID and is a no-op.
+
+Current values, field history, and the processed-event ledger commit atomically. There is no separate inbound worker queue; the outbox worker is only for portal-to-Salesforce calls.
 
 The brief's example contains a changed-field map, so the design treats it as a delta. If Salesforce sends full snapshots, the adapter must identify which fields actually changed and their versions before merging; a full snapshot without field-level versions is not safe to apply over newer portal values.
 
