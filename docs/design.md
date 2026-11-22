@@ -11,7 +11,7 @@ The ordering rule assumes Salesforce event timestamps and portal server timestam
 The Salesforce CRM and Tequity portal are separate systems. The portal owns its Postgres database and the sync worker. Salesforce initiates inbound webhook requests; the portal initiates Salesforce record API requests. Calls to Salesforce, including retries and reconciliation queries, share the 100 requests/second limit.
 
 ```mermaid
-flowchart LR
+flowchart TB
   SF["Salesforce CRM"] -->|"HTTPS webhook"| WH["Portal webhook endpoint"]
   WH -->|"durable inbox"| DB["Portal Postgres"]
   DB -->|"work items"| W["Sync workers"]
@@ -59,7 +59,7 @@ Use a unique constraint on Salesforce event ID and on the Salesforce/portal reco
 2. Insert the event in `inbox_event` keyed by Salesforce `eventId`. If that key already exists, return success without applying or auditing the event a second time.
 3. After the durable insert, acknowledge the webhook. A worker processes it; request latency does not depend on Salesforce writes.
 4. In a database transaction, compare each changed field's version with the stored field version. Write one history row for every distinct valid field change. Update the current field only if this event wins the comparison. Mark the inbox item processed in the same transaction.
-5. A worker retry after a crash sees either the committed transaction or an unprocessed inbox item; it does not partially apply an event.
+5. A worker retry after a crash sees either the committed transaction or an unprocessed inbox item; it does not partially apply an event. If the same event ID is redelivered with a different payload hash, quarantine and alert rather than treating it as an ordinary duplicate.
 
 The brief's example contains a changed-field map, so the design treats it as a delta. If Salesforce sends full snapshots, the adapter must identify which fields actually changed and their versions before merging; a full snapshot without field-level versions is not safe to apply over newer portal values.
 
@@ -87,13 +87,13 @@ These rules require a stable event ID and trustworthy source time. The brief's s
 
 ## 9. Loop prevention
 
-Outbound updates use a dedicated Salesforce integration identity. When the corresponding webhook arrives, the processor recognizes `changedBy` as that identity, stores the delivery/echo for operational traceability, and does not create another outbound event. Human-originated Salesforce edits continue through the normal merge path.
+Outbound updates use a dedicated Salesforce integration identity. When the corresponding webhook arrives, the processor recognizes `changedBy` as that identity, records and merges its field changes using the normal version/history rules, but does not create another outbound event. Human-originated Salesforce edits continue through the normal merge path.
 
 This rule depends on Salesforce echoing the integration actor in `changedBy`. If it does not, use a Salesforce-supported origin/correlation marker and persist its ID with the outbox event. Do not suppress an event merely because its field value matches a recent outbound value: a human can legitimately set the same value, and value matching alone can hide a real edit. If neither actor nor marker is available, reliable loop prevention is an unresolved integration blocker.
 
 ## 10. Six-hour Salesforce outage and recovery arithmetic
 
-Persist the inbox and outbox in Postgres before acknowledging/committing work. During a Salesforce outage, portal edits continue locally and add durable outbox items. Inbound webhooks that never arrive cannot be recovered from the inbox; after Salesforce returns, query Salesforce for records changed since the last confirmed cursor and merge them through the same per-field version/history path. Save each page and its next cursor transactionally. The changed-since query, page size, and cursor guarantees are assumptions requiring confirmation.
+Persist the inbox and outbox in Postgres before acknowledging/committing work. During a Salesforce outage, portal edits continue locally and add durable outbox items. Webhooks that never arrive are not in our inbox. After Salesforce returns, replay a complete, paginated change feed/audit source from the last confirmed cursor and merge every missed edit through the same per-field version/history path. Save each page and its next cursor transactionally. The feed must retain intermediate edits, actors, timestamps, and stable versions for the full outage window; a query that returns only each record's latest snapshot is insufficient to preserve history. The existence, retention, page size, and cursor guarantees of this source are open Salesforce questions.
 
 **Working estimate:** peak rate = 10 edits/second; outage = 6 hours = 21,600 seconds; one outbound Salesforce request per portal edit; after recovery, reserve 10 requests/second for continuing live edits and target 80 requests/second for outbound work, leaving 20 requests/second of the 100-request cap for reconciliation, retries, and operational headroom.
 
@@ -103,7 +103,7 @@ Recovery drain after live traffic = 80 requests/s − 10 live requests/s = 70 re
 Outbox catch-up = 216,000 requests ÷ 70 requests/s = 3,085.7 s ≈ 51.4 minutes
 ```
 
-Reconciliation requests also count against the same 100 requests/second cap. If Salesforce changed-since pagination returns 1,000 records per request and 216,000 records changed during the outage, that is about 216 query requests; at the reserved 20 requests/second, about 10.8 seconds of request capacity, plus response processing. This pagination size and API are assumptions, not facts in the brief. Retries, extra API calls per edit, or more than 10 edits/second increase the total. Recalculate using measured calls per edit and observed reconciliation volume before promising a recovery time. If no changed-since query exists, a full scan or another recovery source is required; do not claim the missed events can be reconstructed from webhooks alone.
+Reconciliation requests also count against the same 100 requests/second cap. If the complete change feed returns 1,000 events per request and 216,000 events occurred during the outage, that is about 216 query requests; at the reserved 20 requests/second, about 10.8 seconds of request capacity, plus response processing. This page size and API are assumptions, not facts in the brief. Retries, extra API calls per edit, or more than 10 edits/second increase the total. Recalculate using measured calls per edit and observed reconciliation volume before promising a recovery time. If Salesforce provides only current snapshots, the system can repair current values but cannot recover the lost intermediate history; that fails a stated requirement until a retained audit feed or another recovery source is agreed.
 
 The 30-second visibility target applies while both systems are up. During the six-hour outage it cannot be met for Salesforce writes; the recovery target is to drain the durable backlog as quickly as the rate limit allows.
 
