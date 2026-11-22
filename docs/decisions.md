@@ -12,6 +12,7 @@ The design below is concrete enough to review, but several decisions depend on S
 | Portal edit identity | The portal backend assigns a UTC timestamp and a monotonically increasing per-record sequence in the same database transaction as the edit. The authenticated user is the actor. | If writes can come from multiple writers or regions, use a centrally ordered version or database change sequence. |
 | Record identity and creates | Each new record is distinct until the integration has a stable cross-system key. Never merge records based only on name, phone, or email. Salesforce supports an idempotent upsert or lookup by a stable portal key for portal-originated creates. | If both systems independently create the same real-world entity, duplicates remain until the client defines a matching key/rule. If create retries cannot be made idempotent, ambiguous timeouts require lookup/reconciliation before retry. |
 | Contact/customer creation | A contact's customer reference can be resolved through the stored cross-system ID mapping; if the customer mapping is not ready, hold the contact work item until it is. | Confirm whether Salesforce can create a contact only after its customer exists, and what to do if the referenced customer was not synced. |
+| Initial 5-million-record load | Salesforce provides a paginated baseline read and a complete change feed that can be started before the scan and replayed from a cursor. | Without a cursorable feed and a safe snapshot/version strategy, edits during the initial scan can be missed or overwritten. Confirm the API and calculate bootstrap duration before cutover. |
 | Cross-system conflict order | UTC timestamps from Salesforce and the portal are close enough to compare, with a deterministic source/event-ID tie-break. | If clock skew cannot be bounded, timestamps alone cannot establish real-world order. Agree on a version/precedence contract or surface conflicts for resolution. |
 | Loop signal | Salesforce webhooks identify the dedicated integration user in `changedBy`, and outbound calls use that identity. | If the actor is not echoed, Salesforce must provide a reliable source marker or correlation field. Without either signal, an echo cannot always be distinguished from a human edit of the same value. |
 | Missed webhook recovery | Salesforce provides a paginated, complete change feed/audit source for the outage window, including every edit, actor, timestamp, and stable event/version marker. | A latest-record snapshot can restore current values but cannot reconstruct intermediate edits or actors. The history requirement cannot be met for missed events without a complete change feed or retained audit source; treat this as a blocker, not as a successful recovery. |
@@ -28,9 +29,10 @@ The design below is concrete enough to review, but several decisions depend on S
 6. What stable cross-system key can identify records created on either side? How should the system handle two independent creates for the same real-world entity?
 7. Can Salesforce upsert by a stable portal key so a create request retried after an ambiguous timeout does not create a duplicate?
 8. How should a contact create behave if its customer record has not yet been mapped on the other system?
-9. Is 10 edits/second a reasonable peak assumption? How many distinct records can one user action change?
-10. What retention period is required for field-change history and webhook idempotency keys?
-11. What should users see when two edits to the same field are close together or cannot be ordered confidently?
+9. What paginated baseline/bulk read is available for the existing 5 million records, and can a change cursor be captured before the load and replayed after it?
+10. Is 10 edits/second a reasonable peak assumption? How many distinct records can one user action change?
+11. What retention period is required for field-change history and webhook idempotency keys?
+12. What should users see when two edits to the same field are close together or cannot be ordered confidently?
 
 ## Decision rule
 

@@ -38,6 +38,12 @@ flowchart TB
 | 6 | Identify echoes and reconcile a webhook gap | A loop or an unobserved Salesforce change would invalidate the sync. | Origin check and reconciliation worker |
 | 7 | Monitor the 30-second target and recovery | Operators need to see lag before users report stale data. | Queue/API metrics and alerts |
 
+## 3a. Bootstrap the existing records
+
+The 5 million records imply an initial baseline load. Before cutover, capture a Salesforce change-feed cursor, page through the existing records, and apply the baseline to `sync_record` and the ID mapping. Keep the webhook endpoint active during the scan, then replay the complete change feed from the captured cursor so edits made during the scan are not lost. Apply the baseline and replayed changes through version-aware writes so an older snapshot cannot overwrite a newer edit. Give live webhook transactions and portal edits priority over background scan pages; the 30-second sync target applies to live changes after the integration is enabled.
+
+This bootstrap depends on a paginated or bulk read and a cursor/version contract that the brief does not specify. Ask for the page size, snapshot consistency, and API limits. As an illustration only, 5 million records at 1,000 records per page would require 5,000 read requests; at 80 requests/second that is at least 62.5 seconds of Salesforce request time, excluding pagination, processing, retries, and ongoing writes. If the API returns fewer records per call, bootstrap takes longer. Do not use the 30-second edit SLO as a claim about full baseline completion.
+
 ## 4. Data stored
 
 Store only the brief's customer fields (`name`, `status`, `owner`) and contact fields (`fullName`, `phone`, `email`, `city`, `owner`, `customerId`), plus the IDs and metadata needed to sync them.
